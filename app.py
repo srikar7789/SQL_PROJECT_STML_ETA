@@ -4,8 +4,6 @@ import re
 import pandas as pd
 import psycopg2
 import streamlit as st
-import sqlite3
-get_csv_sqlite_conn
 
 
 # =========================================================
@@ -25,7 +23,7 @@ st.caption(
 
 
 # =========================================================
-# 2. DATABASE CONFIGURATION
+# 2. DATABASE CONFIGURATION & PANDAS CSV FALLBACK
 # =========================================================
 
 def get_db_config():
@@ -82,6 +80,31 @@ def get_connection():
         **config,
         connect_timeout=5
     )
+
+
+@st.cache_data
+def load_csv_data():
+    """Load Titanic-Dataset.csv using pandas when PostgreSQL is unavailable."""
+
+    csv_candidates = [
+        "Titanic-Dataset.csv",
+        "titanic.csv",
+        "train.csv"
+    ]
+
+    csv_path = next(
+        (f for f in csv_candidates if os.path.exists(f)),
+        None
+    )
+
+    if not csv_path:
+        raise FileNotFoundError(
+            "Could not find Titanic-Dataset.csv in the repository."
+        )
+
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df, csv_path
 
 
 # =========================================================
@@ -145,25 +168,48 @@ def get_database_status():
 
 try:
     db_status = get_database_status()
+    db_status["mode"] = "postgres"
 
     st.success(
         "Connected to PostgreSQL: "
         + db_status["database_name"]
     )
 
-except Exception as error:
+except Exception as pg_error:
 
-    st.error("Could not connect to PostgreSQL.")
+    try:
+        _, csv_filename = load_csv_data()
 
-    st.info(
-        "Check the host, port, database name, username, "
-        "password, network access, and table permissions."
-    )
+        db_status = {
+            "mode": "csv",
+            "database_name": f"Pandas CSV ({csv_filename})",
+            "current_schema": "titanic_project",
+            "postgres_version": "Pandas Fallback"
+        }
 
-    with st.expander("Connection error details"):
-        st.code(str(error))
+        st.info(
+            f"Running in Cloud Pandas Mode using `{csv_filename}` "
+            "(local PostgreSQL is offline)."
+        )
 
-    st.stop()
+    except Exception as csv_error:
+
+        st.error(
+            "Could not connect to PostgreSQL or load Titanic-Dataset.csv."
+        )
+
+        st.info(
+            "Check the host, port, database name, username, "
+            "password, or verify Titanic-Dataset.csv is in GitHub."
+        )
+
+        with st.expander("Connection error details"):
+            st.code(
+                f"PostgreSQL error: {pg_error}\n"
+                f"CSV error: {csv_error}"
+            )
+
+        st.stop()
 
 
 # =========================================================
@@ -201,27 +247,41 @@ with dashboard_tab:
 
     st.header("Passenger Dashboard")
 
-    count_df = read_query(
-        """
-        SELECT COUNT(*) AS total_passengers
-        FROM titanic_project.passengers
-        """
-    )
+    if db_status["mode"] == "postgres":
 
-    total_passengers = int(
-        count_df.iloc[0]["total_passengers"]
-    )
+        count_df = read_query(
+            """
+            SELECT COUNT(*) AS total_passengers
+            FROM titanic_project.passengers
+            """
+        )
 
-    survivor_df = read_query(
-        """
-        SELECT
-            survived,
-            COUNT(*) AS passenger_count
-        FROM titanic_project.passengers
-        GROUP BY survived
-        ORDER BY survived
-        """
-    )
+        total_passengers = int(
+            count_df.iloc[0]["total_passengers"]
+        )
+
+        survivor_df = read_query(
+            """
+            SELECT
+                survived,
+                COUNT(*) AS passenger_count
+            FROM titanic_project.passengers
+            GROUP BY survived
+            ORDER BY survived
+            """
+        )
+
+    else:
+
+        df, _ = load_csv_data()
+        total_passengers = int(len(df))
+
+        survivor_df = (
+            df.groupby("survived", as_index=False)
+            .size()
+            .rename(columns={"size": "passenger_count"})
+            .sort_values("survived")
+        )
 
     survived_count = 0
     not_survived_count = 0
@@ -263,17 +323,29 @@ with dashboard_tab:
 
     st.subheader("Survival by Passenger Class")
 
-    class_df = read_query(
-        """
-        SELECT
-            pclass,
-            survived,
-            COUNT(*) AS passenger_count
-        FROM titanic_project.passengers
-        GROUP BY pclass, survived
-        ORDER BY pclass, survived
-        """
-    )
+    if db_status["mode"] == "postgres":
+
+        class_df = read_query(
+            """
+            SELECT
+                pclass,
+                survived,
+                COUNT(*) AS passenger_count
+            FROM titanic_project.passengers
+            GROUP BY pclass, survived
+            ORDER BY pclass, survived
+            """
+        )
+
+    else:
+
+        df, _ = load_csv_data()
+        class_df = (
+            df.groupby(["pclass", "survived"], as_index=False)
+            .size()
+            .rename(columns={"size": "passenger_count"})
+            .sort_values(["pclass", "survived"])
+        )
 
     class_pivot = class_df.pivot(
         index="pclass",
@@ -298,17 +370,29 @@ with dashboard_tab:
 
     st.subheader("Survival by Sex")
 
-    sex_df = read_query(
-        """
-        SELECT
-            sex,
-            survived,
-            COUNT(*) AS passenger_count
-        FROM titanic_project.passengers
-        GROUP BY sex, survived
-        ORDER BY sex, survived
-        """
-    )
+    if db_status["mode"] == "postgres":
+
+        sex_df = read_query(
+            """
+            SELECT
+                sex,
+                survived,
+                COUNT(*) AS passenger_count
+            FROM titanic_project.passengers
+            GROUP BY sex, survived
+            ORDER BY sex, survived
+            """
+        )
+
+    else:
+
+        df, _ = load_csv_data()
+        sex_df = (
+            df.groupby(["sex", "survived"], as_index=False)
+            .size()
+            .rename(columns={"size": "passenger_count"})
+            .sort_values(["sex", "survived"])
+        )
 
     sex_pivot = sex_df.pivot(
         index="sex",
@@ -327,22 +411,35 @@ with dashboard_tab:
 
     st.subheader("Missing Values")
 
-    missing_df = read_query(
-        """
-        SELECT
-            COUNT(*) - COUNT(age) AS missing_age,
-            COUNT(*) - COUNT(embarked) AS missing_embarked,
-            COUNT(*) - COUNT(cabin) AS missing_cabin
-        FROM titanic_project.passengers
-        """
-    )
+    if db_status["mode"] == "postgres":
+
+        missing_df = read_query(
+            """
+            SELECT
+                COUNT(*) - COUNT(age) AS missing_age,
+                COUNT(*) - COUNT(embarked) AS missing_embarked,
+                COUNT(*) - COUNT(cabin) AS missing_cabin
+            FROM titanic_project.passengers
+            """
+        )
+
+        missing_age = int(missing_df.iloc[0]["missing_age"])
+        missing_embarked = int(missing_df.iloc[0]["missing_embarked"])
+        missing_cabin = int(missing_df.iloc[0]["missing_cabin"])
+
+    else:
+
+        df, _ = load_csv_data()
+        missing_age = int(df["age"].isna().sum())
+        missing_embarked = int(df["embarked"].isna().sum())
+        missing_cabin = int(df["cabin"].isna().sum())
 
     missing_report = pd.DataFrame({
         "Column": ["Age", "Embarked", "Cabin"],
         "Missing Values": [
-            int(missing_df.iloc[0]["missing_age"]),
-            int(missing_df.iloc[0]["missing_embarked"]),
-            int(missing_df.iloc[0]["missing_cabin"])
+            missing_age,
+            missing_embarked,
+            missing_cabin
         ]
     })
 
@@ -405,40 +502,71 @@ with explorer_tab:
 
         else:
 
-            query = """
-                SELECT
-                    passengerid,
-                    name,
-                    sex,
-                    age,
-                    sibsp,
-                    parch,
-                    embarked,
-                    ticket,
-                    fare,
-                    cabin,
-                    pclass,
-                    survived
-                FROM titanic_project.passengers
-                WHERE
-                    pclass = ANY(%s)
-                    AND sex = ANY(%s)
-                    AND survived = ANY(%s)
-                ORDER BY passengerid
-                LIMIT %s
-            """
-
             try:
 
-                filtered_df = read_query(
-                    query,
-                    (
-                        selected_class,
-                        selected_sex,
-                        selected_survival,
-                        row_limit
+                if db_status["mode"] == "postgres":
+
+                    query = """
+                        SELECT
+                            passengerid,
+                            name,
+                            sex,
+                            age,
+                            sibsp,
+                            parch,
+                            embarked,
+                            ticket,
+                            fare,
+                            cabin,
+                            pclass,
+                            survived
+                        FROM titanic_project.passengers
+                        WHERE
+                            pclass = ANY(%s)
+                            AND sex = ANY(%s)
+                            AND survived = ANY(%s)
+                        ORDER BY passengerid
+                        LIMIT %s
+                    """
+
+                    filtered_df = read_query(
+                        query,
+                        (
+                            selected_class,
+                            selected_sex,
+                            selected_survival,
+                            row_limit
+                        )
                     )
-                )
+
+                else:
+
+                    df, _ = load_csv_data()
+
+                    cols = [
+                        "passengerid",
+                        "name",
+                        "sex",
+                        "age",
+                        "sibsp",
+                        "parch",
+                        "embarked",
+                        "ticket",
+                        "fare",
+                        "cabin",
+                        "pclass",
+                        "survived"
+                    ]
+
+                    filtered_df = (
+                        df[
+                            df["pclass"].isin(selected_class)
+                            & df["sex"].isin(selected_sex)
+                            & df["survived"].isin(selected_survival)
+                        ][cols]
+                        .sort_values("passengerid")
+                        .head(row_limit)
+                    )
 
                 st.success(
                     f"Retrieved {len(filtered_df)} records."
@@ -468,14 +596,21 @@ with explorer_tab:
 
     if st.button("Load Staging Table Preview"):
 
-        staging_df = read_query(
-            """
-            SELECT *
-            FROM titanic_project.titanic_staging
-            ORDER BY passengerid
-            LIMIT 20
-            """
-        )
+        if db_status["mode"] == "postgres":
+
+            staging_df = read_query(
+                """
+                SELECT *
+                FROM titanic_project.titanic_staging
+                ORDER BY passengerid
+                LIMIT 20
+                """
+            )
+
+        else:
+
+            df, _ = load_csv_data()
+            staging_df = df.sort_values("passengerid").head(20)
 
         st.dataframe(
             staging_df,
@@ -642,6 +777,67 @@ ORDER BY pclass
 
         return True, cleaned
 
+    def run_pandas_example(example_name, df):
+        """Return the exact pandas equivalent of the selected example query."""
+
+        if example_name == "Show 10 passengers":
+            return df.head(10)
+
+        if example_name == "Count passengers":
+            return pd.DataFrame({"total_passengers": [len(df)]})
+
+        if example_name == "Survival distribution":
+            return (
+                df.groupby("survived", as_index=False)
+                .size()
+                .rename(columns={"size": "passenger_count"})
+                .sort_values("survived")
+            )
+
+        if example_name == "Average age by class":
+            return (
+                df.groupby("pclass", as_index=False)["age"]
+                .mean()
+                .round(2)
+                .rename(columns={"age": "average_age"})
+                .sort_values("pclass")
+            )
+
+        if example_name == "Survival rate by sex":
+            res = (
+                df.groupby("sex", as_index=False)
+                .agg(
+                    total_passengers=("survived", "count"),
+                    survivors=("survived", "sum")
+                )
+                .sort_values("sex")
+            )
+            res["survival_percentage"] = (
+                100.0 * res["survivors"] / res["total_passengers"]
+            ).round(2)
+            return res
+
+        if example_name == "Passengers with missing ages":
+            return (
+                df[df["age"].isna()][
+                    ["passengerid", "name", "sex", "age", "pclass"]
+                ]
+                .sort_values("passengerid")
+                .head(50)
+            )
+
+        return (
+            df.groupby("pclass", as_index=False)["fare"]
+            .agg(
+                passenger_count="count",
+                average_fare="mean",
+                minimum_fare="min",
+                maximum_fare="max"
+            )
+            .round(2)
+            .sort_values("pclass")
+        )
+
     if st.button("Run SQL Query"):
 
         valid, result = validate_read_only_query(sql_text)
@@ -652,13 +848,49 @@ ORDER BY pclass
 
         else:
 
-            try:
+            if db_status["mode"] == "postgres":
 
-                result_df = read_query(result)
+                try:
 
-                st.success(
-                    "Query executed successfully. "
-                    f"Rows returned: {len(result_df)}"
+                    result_df = read_query(result)
+
+                    st.success(
+                        "Query executed successfully. "
+                        f"Rows returned: {len(result_df)}"
+                    )
+
+                    st.dataframe(
+                        result_df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.download_button(
+                        "Download Query Result",
+                        data=result_df.to_csv(index=False),
+                        file_name="sql_query_result.csv",
+                        mime="text/csv"
+                    )
+
+                except Exception as error:
+
+                    st.error(
+                        "The query could not be executed. "
+                        "Check the SQL syntax and permissions."
+                    )
+
+                    with st.expander("Error details"):
+                        st.code(str(error))
+
+            else:
+
+                df, _ = load_csv_data()
+                result_df = run_pandas_example(selected_example, df)
+
+                st.info(
+                    "Running in Cloud Pandas Mode: showing the exact "
+                    f"pandas result for '{selected_example}'. "
+                    "Connect PostgreSQL locally to run custom SQL."
                 )
 
                 st.dataframe(
@@ -673,16 +905,6 @@ ORDER BY pclass
                     file_name="sql_query_result.csv",
                     mime="text/csv"
                 )
-
-            except Exception as error:
-
-                st.error(
-                    "The query could not be executed. "
-                    "Check the SQL syntax and permissions."
-                )
-
-                with st.expander("Error details"):
-                    st.code(str(error))
 
     st.divider()
 
